@@ -1,0 +1,5 @@
+# Spark-side app deps (installed AFTER the JAR-prefetch layer so adding a dep
+# here doesn't re-download Spark JARs). Spark itself is pinned in the Dockerfile.
+pytest==8.3.4
+requests==2.32.3
+psycopg[binary]==3.2.13

@@ -1,0 +1,31 @@
+# Shift.ai — host-side Python tooling (seed, reconcile, API, AI layer).
+# PySpark / Airflow run inside their own containers with pinned images,
+# so they are intentionally NOT pinned here.
+
+# --- Database drivers ---
+psycopg[binary]==3.2.13
+snowflake-connector-python==3.12.3
+
+# --- Kafka / Avro (depth checkpoint: read raw Debezium messages) ---
+confluent-kafka[avro,schemaregistry]==2.14.2
+fastavro==1.12.2
+requests==2.32.3
+
+# --- Seeding ---
+faker==30.8.2
+
+# --- API ---
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+sse-starlette==2.1.3
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# --- AI layer ---
+anthropic==0.40.0
+openai==1.57.4
+qdrant-client==1.12.1
+
+# --- Dev / test ---
+pytest==8.3.4
+python-dotenv==1.0.1

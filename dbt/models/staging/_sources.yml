@@ -1,0 +1,15 @@
+version: 2
+
+sources:
+  - name: raw
+    description: Silver tables landed into Snowflake by the Spark loader.
+    database: "{{ env_var('SNOWFLAKE_DATABASE', 'SHIFT') }}"
+    schema: RAW
+    tables:
+      - name: customers
+      - name: products
+      - name: orders
+      - name: inventory
+      - name: shipments
+      - name: migration_metadata
+        description: Reconciliation results written by reconcile.py (Phase 7).

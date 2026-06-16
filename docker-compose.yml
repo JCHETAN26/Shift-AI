@@ -1,0 +1,296 @@
+# Shift.ai local stack.
+# Phase 0–1 services (Postgres, Kafka, Schema Registry, Debezium, Qdrant)
+# use off-the-shelf images and run today. Spark, Airflow, API, and UI get
+# their own build contexts and are added in later phases.
+
+name: shift-ai
+
+services:
+  # ── Source database (WAL/logical replication for CDC) ──────────
+  postgres:
+    image: postgres:16
+    container_name: shift-postgres
+    command:
+      - "postgres"
+      - "-c"
+      - "config_file=/etc/postgresql/postgresql.conf"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-shift}
+      POSTGRES_USER: ${POSTGRES_USER:-shift}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shift_dev_password}
+    ports:
+      - "5435:5432"
+    volumes:
+      - ./infra/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./infra/postgres/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shift} -d ${POSTGRES_DB:-shift}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Kafka coordination ─────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: shift-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      # Port-listening check — avoids ZK's four-letter-word whitelist, and is
+      # sufficient signal that the broker can connect.
+      test: ["CMD-SHELL", "nc -z localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Kafka broker (Apache Kafka 3.7 via Confluent Platform 7.6) ──
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: shift-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners: internal (containers) + external (host tooling)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  # ── Confluent Schema Registry (Avro schemas for CDC topics) ─────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    container_name: shift-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # ── Debezium Connect (Postgres CDC connector, Avro converter) ───
+  debezium-connect:
+    build:
+      context: ./infra/debezium
+    image: shift/debezium-connect:2.5
+    container_name: shift-debezium
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: shift-connect
+      CONFIG_STORAGE_TOPIC: shift_connect_configs
+      OFFSET_STORAGE_TOPIC: shift_connect_offsets
+      STATUS_STORAGE_TOPIC: shift_connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Avro converters backed by Schema Registry
+      KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # ── Spark (PySpark 3.5 + Delta Lake 3.0, local mode) ───────────
+  # Runs the CDC merge job + unit tests. Idle (`sleep infinity`) until a job
+  # or `make test` execs into it; the JVM only spins up when a job starts.
+  spark:
+    build:
+      context: ./infra/spark
+    image: shift/spark:3.5
+    container_name: shift-spark
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      DELTA_BRONZE_PATH: /data/delta/bronze
+      DELTA_SILVER_PATH: /data/delta/silver
+      # Internal hostname (the proxy port 5435 is host-only).
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-shift}:${POSTGRES_PASSWORD:-shift_dev_password}@postgres:5432/${POSTGRES_DB:-shift}
+    # Brings SNOWFLAKE_* (and other) vars in for the load_snowflake job.
+    # Recreate the container (`docker compose up -d spark`) after editing .env.
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      - deltadata:/data/delta
+    working_dir: /app
+
+  # ── dbt (Gold models on Snowflake) ─────────────────────────────
+  # Not started by default; run via `docker compose run --rm dbt ...`.
+  dbt:
+    build:
+      context: ./infra/dbt
+    image: shift/dbt:1.8
+    container_name: shift-dbt
+    profiles: ["snowflake"]
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    working_dir: /app/dbt
+
+  # ── API + AI layer (RAG catalog, LLM analyzers, FastAPI) ───────
+  api:
+    build:
+      context: ./infra/api
+    image: shift/api:latest
+    container_name: shift-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-shift}:${POSTGRES_PASSWORD:-shift_dev_password}@postgres:5432/${POSTGRES_DB:-shift}
+      QDRANT_URL: http://qdrant:6333
+      PYTHONPATH: /app
+    volumes:
+      - ./:/app
+    working_dir: /app
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+  # ── React dashboard (Vite dev server, proxies /api → api) ──────
+  ui:
+    image: node:20-slim
+    container_name: shift-ui
+    working_dir: /app/ui
+    command: sh -c "npm install --no-fund --no-audit && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - api
+    volumes:
+      - ./:/app
+    ports:
+      - "5173:5173"
+
+  # ── Qdrant (RAG data catalog vector store) ─────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.12.1
+    container_name: shift-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+
+  # ── Airflow (orchestration — 4 DAGs) ───────────────────────────
+  # Under the "airflow" profile; start with: make airflow
+  airflow-db:
+    image: postgres:16
+    container_name: shift-airflow-db
+    profiles: ["airflow"]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflowdb:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  airflow-init:
+    build:
+      context: ./infra/airflow
+    image: shift/airflow:2.8
+    container_name: shift-airflow-init
+    profiles: ["airflow"]
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment: &airflow-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    user: "50000:0"
+    volumes:
+      - ./src/orchestration/dags:/opt/airflow/dags
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - "airflow db migrate && airflow users create --username admin --password admin
+         --firstname Shift --lastname Admin --role Admin --email admin@shift.ai || true"
+
+  airflow-scheduler:
+    image: shift/airflow:2.8
+    container_name: shift-airflow-scheduler
+    profiles: ["airflow"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-env
+    user: "50000:0"
+    volumes:
+      - ./src/orchestration/dags:/opt/airflow/dags
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: scheduler
+    restart: unless-stopped
+
+  airflow-webserver:
+    image: shift/airflow:2.8
+    container_name: shift-airflow-web
+    profiles: ["airflow"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-env
+    user: "50000:0"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./src/orchestration/dags:/opt/airflow/dags
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: webserver
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  qdrantdata:
+  deltadata:
+  airflowdb:

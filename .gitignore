@@ -1,0 +1,46 @@
+# Secrets
+.env
+*.pem
+*.key
+# Snowflake key-pair (private + public)
+infra/snowflake/rsa_key.p8
+infra/snowflake/rsa_key.pub
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Data / warehouse artifacts
+data/
+!data/.gitkeep
+*.parquet
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Delta / checkpoints
+**/_delta_log/
+**/checkpoints/
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+.user.yml
+
+# Node / UI
+node_modules/
+ui/dist/
+ui/.vite/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
