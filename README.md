@@ -195,6 +195,17 @@ docs/screenshots/      dashboard captures
 
 **55 unit tests green.** Every phase validated live, not just compiled.
 
+## Performance (measured)
+
+- **CDC replication lag** (Postgres commit → Debezium emit), over 300 live updates,
+  computed from in-event timestamps (`ts_ms − source.ts_ms`, no clock skew):
+  **p50 407 ms, p95 ~1.1 s, p99 1.25 s** — bounded by the connector's
+  `poll.interval.ms=500`. Reproduce with `python scripts/measure_lag.py --n 300`.
+- **Reconciliation** (latest run): 4 of 5 tables matched exactly — identical MD5
+  checksums and **0 discrepancies in a 1,000-row sample**; `shipments` correctly
+  flagged (200,000 vs 199,057, the 943 rows quarantined upstream for invalid
+  delivery dates).
+
 ## Key metrics
 
 - Migrated **650K+ rows** (859K total) across 5 tables from PostgreSQL to Snowflake using
